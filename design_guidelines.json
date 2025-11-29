@@ -1,0 +1,160 @@
+{
+  "identity": {
+    "persona": "E1: The Anti-AI Designer",
+    "mission": "Create a 'Control Room' aesthetic that feels like a high-frequency trading terminal mixed with a luxury asset portfolio. Reject generic SaaS flatness.",
+    "emotional_tone": "Precision, Authority, Wealth, Volatility",
+    "visual_archetype": "Swiss & High-Contrast (Dark Mode Only)"
+  },
+  "typography": {
+    "headings": {
+      "family": "Manrope",
+      "weights": ["600", "800"],
+      "usage": "Section titles, Asset names, Big metrics",
+      "letter_spacing": "tracking-tight"
+    },
+    "body": {
+      "family": "Inter",
+      "weights": ["400", "500"],
+      "usage": "General UI text, descriptions"
+    },
+    "data": {
+      "family": "JetBrains Mono",
+      "weights": ["400", "700"],
+      "usage": "Prices, Tickers, Percentages, Timestamps",
+      "letter_spacing": "tracking-wide"
+    },
+    "rules": [
+      "Never use Inter for Headings.",
+      "All financial data MUST use JetBrains Mono.",
+      "Headings > 32px must use tracking-tighter."
+    ]
+  },
+  "colors": {
+    "palette": {
+      "background": {
+        "default": "#09090B",
+        "paper": "#121214",
+        "subtle": "#18181B"
+      },
+      "primary": {
+        "main": "#D4AF37",
+        "description": "Metallic Gold - Use for primary actions and 'Precious Metals' highlights"
+      },
+      "accents": {
+        "energy": "#FF4500",
+        "profit": "#00FF94",
+        "loss": "#FF0055",
+        "info": "#3B82F6"
+      },
+      "text": {
+        "primary": "#FAFAFA",
+        "secondary": "#A1A1AA",
+        "muted": "#52525B"
+      },
+      "border": {
+        "default": "#27272A",
+        "active": "#3F3F46"
+      }
+    },
+    "gradients": {
+      "gold_rush": "linear-gradient(135deg, #D4AF37 0%, #AA8A2E 100%)",
+      "oil_burn": "linear-gradient(135deg, #FF4500 0%, #CC3700 100%)",
+      "dark_glass": "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.01) 100%)"
+    },
+    "rules": [
+      "NO TEAL (#1B93A4) for dashboards.",
+      "Backgrounds must be dark charcoal (#09090B), NEVER pure black (#000000) unless for contrast layers.",
+      "Use 'Profit' Green (#00FF94) sparingly - only for positive deltas."
+    ]
+  },
+  "layout": {
+    "grid_system": "The Control Room Grid",
+    "spacing_scale": "Generous (2x standard)",
+    "container_padding": "p-6 or p-8 for cards",
+    "modes": {
+      "dashboard": {
+        "type": "Bento Grid",
+        "cols": "grid-cols-12",
+        "gap": "gap-4",
+        "rules": "Dense, no wasted space. Use col-span-X to create hierarchy."
+      },
+      "marketing": {
+        "type": "Tetris Grid",
+        "cols": "grid-cols-12",
+        "gap": "gap-12",
+        "rules": "Asymmetry is key. Leave negative space."
+      }
+    }
+  },
+  "components": {
+    "cards": {
+      "style": "Glassmorphism (Dark)",
+      "classes": "bg-zinc-900/50 backdrop-blur-xl border border-white/10 shadow-2xl",
+      "hover": "hover:border-white/20 transition-all duration-300"
+    },
+    "buttons": {
+      "primary": "bg-[#D4AF37] text-black font-bold hover:bg-[#AA8A2E] rounded-none uppercase tracking-widest text-xs px-6 py-3",
+      "secondary": "bg-transparent border border-white/20 text-white hover:bg-white/5 rounded-none uppercase tracking-widest text-xs px-6 py-3"
+    },
+    "charts": {
+      "library": "Recharts",
+      "style": "Minimalist. No grid lines. Tooltips must be dark glass.",
+      "colors": ["#D4AF37", "#FF4500", "#00FF94", "#3B82F6"]
+    },
+    "inputs": {
+      "style": "Terminal Input",
+      "classes": "bg-black/50 border-b border-white/20 focus:border-[#D4AF37] rounded-none px-0 py-2 text-white placeholder:text-zinc-600 font-mono"
+    }
+  },
+  "visual_enhancers": {
+    "textures": "Use subtle noise overlays on the main background to prevent banding.",
+    "borders": "Use 'Tracing Beam' effects for active cards.",
+    "shadows": "Glow effects instead of drop shadows. e.g., shadow-[0_0_20px_rgba(212,175,55,0.1)]"
+  },
+  "media": {
+    "image_urls": {
+      "gold_abstract": "https://images.unsplash.com/photo-1728853696418-c2c2a7f998fb?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "oil_ocean": "https://images.unsplash.com/photo-1562429018-bb47b9c389d0?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "shipping_aerial": "https://images.unsplash.com/photo-1724597500306-a4cbb7d1324e?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "market_floor": "https://images.unsplash.com/photo-1611974765270-ca1258634369?crop=entropy&cs=srgb&fm=jpg&q=85"
+    },
+    "usage_rules": [
+      "Images must be desaturated or tinted to match the dark theme.",
+      "Use 'gold_abstract' for Precious Metals section backgrounds.",
+      "Use 'oil_ocean' for Energy section backgrounds.",
+      "Use 'shipping_aerial' for Freight Simulator hero."
+    ]
+  },
+  "3d_libraries": {
+    "freight_sim": {
+      "library": "react-globe.gl",
+      "usage": "Interactive globe to show shipping routes. Background must be transparent."
+    },
+    "hero_visuals": {
+      "library": "framer-motion",
+      "usage": "Subtle parallax on scroll."
+    }
+  },
+  "accessibility": {
+    "contrast": "Ensure text is #FAFAFA or #E4E4E7 on dark backgrounds.",
+    "focus_states": "Visible ring with color #D4AF37.",
+    "reduced_motion": "Respect user preferences."
+  },
+  "instructions_to_main_agent": [
+    "1. INSTALL FONTS: Add Manrope and JetBrains Mono via Google Fonts in index.html or CSS.",
+    "2. THEME SETUP: Force 'dark' class on the html element. This is a dark-mode-first app.",
+    "3. LAYOUT: Build the 'Dashboard Overview' using the 'Control Room' grid (dense, bento-style).",
+    "4. CHARTS: Use Recharts. Style them to look like financial terminals (minimal axes, neon lines).",
+    "5. FREIGHT SIM: If react-globe.gl is too heavy, use a high-quality map image with animated SVG paths.",
+    "6. NEWS FEED: Use a 'Ticker' style layout or a dense list with 'JetBrains Mono' timestamps.",
+    "7. FORECASTING: Visualize Prophet data with a 'Confidence Interval' band (transparent fill) around the main price line."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Avoid 'AI Slop' - no generic centered layouts.",
+    "Use 2-3x more spacing than you think is necessary.",
+    "Every interaction needs a micro-animation.",
+    "Use 'sonner' for toasts.",
+    "Components MUST use named exports.",
+    "Pages MUST use default exports."
+  ]
+}
