@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory price cache: { stooq_symbol: (data_dict, datetime) }
 price_cache: Dict[str, Any] = {}
-CACHE_TTL = timedelta(minutes=30)
+CACHE_TTL = timedelta(minutes=5)
 
 # In-memory watchlist store
 watchlist_store: Dict[str, Dict] = {}
@@ -225,8 +225,11 @@ async def set_cached_price(stooq_symbol: str, data: Dict):
 
 async def get_price(item: Dict) -> Dict:
     """
-    Get current price derived from the last bar of recent Stooq history.
-    This guarantees the ticker and chart always show the same data source.
+    Get live intraday price.
+    1. Memory cache (30 min TTL)
+    2. Stooq LIVE quote endpoint  ← real-time intraday
+    3. Last bar of recent history  ← end-of-day fallback
+    4. Base price fallback
     """
     stooq = item["stooq"]
     mult  = item.get("mult", 1.0)
@@ -235,50 +238,60 @@ async def get_price(item: Dict) -> Dict:
     if cached:
         return cached
 
-    # Fetch recent history and take the last two bars
+    # ── 1. Live quote (intraday) ──────────────────────────────────────
+    raw = await fetch_stooq_quote(stooq)
+    if raw and raw["price"] > 0:
+        result = {
+            "price":          round(raw["price"]  * mult, 4),
+            "change":         round(raw["change"] * mult, 4),
+            "change_percent": round(raw["change_percent"], 4),
+            "high":           round(raw["high"]   * mult, 4),
+            "low":            round(raw["low"]    * mult, 4),
+            "volume":         raw["volume"],
+        }
+        await set_cached_price(stooq, result)
+        return result
+
+    # ── 2. Last bar of history (EOD fallback) ────────────────────────
     df = await fetch_stooq_history(stooq, days=10)
     if df is not None and not df.empty:
-        # Numeric-ify all OHLC columns
         for col in ["Open", "High", "Low", "Close"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["Close"])
-
         if not df.empty:
-            last = df.iloc[-1]
+            last   = df.iloc[-1]
             price  = float(last["Close"]) * mult
             high   = float(last.get("High",  last["Close"])) * mult
             low    = float(last.get("Low",   last["Close"])) * mult
             volume = int(float(last.get("Volume", 0) or 0))
-
             change, change_pct = 0.0, 0.0
             if len(df) >= 2:
                 prev = float(df.iloc[-2]["Close"]) * mult
-                change = price - prev
+                change     = price - prev
                 change_pct = (change / prev * 100) if prev else 0.0
-
             result = {
-                "price": round(price, 4),
-                "change": round(change, 4),
+                "price":          round(price,      4),
+                "change":         round(change,     4),
                 "change_percent": round(change_pct, 4),
-                "high": round(high, 4),
-                "low": round(low, 4),
-                "volume": volume,
+                "high":           round(high,  4),
+                "low":            round(low,   4),
+                "volume":         volume,
             }
             await set_cached_price(stooq, result)
             return result
 
-    # Fallback: realistic variation on base price
+    # ── 3. Static base-price fallback ────────────────────────────────
     bp = item["base_price"]
     change_pct = random.uniform(-1.0, 1.0)
     change = bp * change_pct / 100
     price  = bp + change
     return {
-        "price": round(price, 4),
-        "change": round(change, 4),
+        "price":          round(price,      4),
+        "change":         round(change,     4),
         "change_percent": round(change_pct, 4),
-        "high": round(price * 1.005, 4),
-        "low": round(price * 0.995, 4),
+        "high":           round(price * 1.005, 4),
+        "low":            round(price * 0.995, 4),
         "volume": 0,
     }
 
