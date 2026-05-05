@@ -97,10 +97,10 @@ COMMODITIES = {
         {"symbol": "NG",    "name": "Natural Gas",     "stooq": "ng.f",    "mult": 1.0,  "base_price": 3.20},
     ],
     "precious_metals": [
-        # Use spot forex rates – always in USD, no contract rollover issues
-        {"symbol": "XAU",   "name": "Gold",            "stooq": "xauusd",  "mult": 1.0,  "base_price": 3250.0},
-        {"symbol": "XAG",   "name": "Silver",          "stooq": "xagusd",  "mult": 1.0,  "base_price": 32.50},
-        {"symbol": "XPT",   "name": "Platinum",        "stooq": "xptusd",  "mult": 1.0,  "base_price": 1000.0},
+        # Spot forex for quote (live intraday); futures for history (more reliable daily bars)
+        {"symbol": "XAU", "name": "Gold",     "stooq": "xauusd", "history_stooq": "gc.f",  "mult": 1.0,  "base_price": 3250.0},
+        {"symbol": "XAG", "name": "Silver",   "stooq": "xagusd", "history_stooq": "si.f",  "mult": 1.0,  "base_price": 32.50},
+        {"symbol": "XPT", "name": "Platinum", "stooq": "xptusd", "history_stooq": "pl.f",  "mult": 1.0,  "base_price": 1000.0},
     ],
     "industrial_metals": [
         # HG = COMEX copper in cents/lb → mult 0.01 gives $/lb
@@ -434,7 +434,16 @@ async def get_commodity_history(symbol: str, days: int = 30):
         raise HTTPException(status_code=404, detail="Commodity not found")
 
     mult = item.get("mult", 1.0)
-    df = await fetch_stooq_history(item["stooq"], days=max(days, 30))
+    fetch_days = max(days, 30)
+
+    # Try primary stooq symbol for history
+    df = await fetch_stooq_history(item["stooq"], days=fetch_days)
+
+    # If primary fails, try dedicated history symbol (e.g. gc.f for gold)
+    if (df is None or df.empty) and item.get("history_stooq"):
+        df = await fetch_stooq_history(item["history_stooq"], days=fetch_days)
+        # Silver futures are in cents/oz — same mult applies
+
     if df is not None and not df.empty:
         for col in ["Open", "High", "Low", "Close"]:
             if col in df.columns:
@@ -443,18 +452,20 @@ async def get_commodity_history(symbol: str, days: int = 30):
         history = []
         for _, row in df.tail(days).iterrows():
             history.append({
-                "date": str(row["Date"])[:10],
-                "open":  round(float(row.get("Open",  row["Close"])) * mult, 4),
-                "high":  round(float(row.get("High",  row["Close"])) * mult, 4),
-                "low":   round(float(row.get("Low",   row["Close"])) * mult, 4),
-                "close": round(float(row["Close"]) * mult, 4),
+                "date":   str(row["Date"])[:10],
+                "open":   round(float(row.get("Open",  row["Close"])) * mult, 4),
+                "high":   round(float(row.get("High",  row["Close"])) * mult, 4),
+                "low":    round(float(row.get("Low",   row["Close"])) * mult, 4),
+                "close":  round(float(row["Close"]) * mult, 4),
                 "volume": int(float(row.get("Volume", 0) or 0)),
             })
         if history:
             return {"symbol": item["symbol"], "name": item["name"], "history": history}
 
-    # Fallback
-    history = generate_historical_prices(item["base_price"], days)
+    # Last resort fallback: anchor to LIVE price so chart matches ticker
+    live_data = await get_price(item)
+    anchor_price = live_data["price"]  # actual current market price
+    history = generate_historical_prices(anchor_price, days)
     return {"symbol": item["symbol"], "name": item["name"], "history": history}
 
 @api_router.get("/commodities/{symbol}/forecast")
