@@ -129,6 +129,51 @@ def get_commodity_by_symbol(symbol: str):
                 return item, category
     return None, None
 
+def batch_fetch_all_prices():
+    """Fetches all commodity prices in a single batch request to avoid rate limits."""
+    now = datetime.now()
+    all_symbols = []
+    for items in COMMODITIES.values():
+        for item in items:
+            all_symbols.append(item["yahoo_symbol"])
+    
+    try:
+        # Download all at once - 1 request instead of 11
+        data = yf.download(all_symbols, period="2d", interval="1d", group_by='ticker', progress=False)
+        
+        for symbol in all_symbols:
+            try:
+                if symbol in data.columns.get_level_values(0):
+                    ticker_df = data[symbol]
+                    if not ticker_df.empty:
+                        # Get latest valid price
+                        valid_data = ticker_df.dropna(subset=['Close'])
+                        if not valid_data.empty:
+                            last_row = valid_data.iloc[-1]
+                            price = float(last_row['Close'])
+                            
+                            # Calculate change
+                            change = 0
+                            change_pct = 0
+                            if len(valid_data) >= 2:
+                                prev_price = float(valid_data.iloc[-2]['Close'])
+                                change = price - prev_price
+                                change_pct = (change / prev_price) * 100
+                            
+                            result = {
+                                "price": price,
+                                "change": change,
+                                "change_percent": change_pct,
+                                "high": float(last_row['High']),
+                                "low": float(last_row['Low']),
+                                "volume": int(last_row['Volume'])
+                            }
+                            price_cache[symbol] = (result, now)
+            except Exception as e:
+                logger.error(f"Error processing batch item {symbol}: {e}")
+    except Exception as e:
+        logger.error(f"Batch fetch failed: {e}")
+
 def get_real_price(yahoo_symbol: str):
     # Check cache first
     now = datetime.now()
@@ -137,50 +182,14 @@ def get_real_price(yahoo_symbol: str):
         if now - timestamp < CACHE_EXPIRATION:
             return cached_data
 
-    try:
-        ticker = yf.Ticker(yahoo_symbol)
-        data = ticker.fast_info
-        
-        # Use fast_info properties instead of dictionary access for better compatibility
-        price = getattr(data, 'last_price', None)
-        
-        if not price or np.isnan(price):
-            # Fallback to history
-            hist = ticker.history(period="1d")
-            if not hist.empty:
-                price = hist['Close'].iloc[-1]
-        
-        if not price:
-            return None
-
-        # Get change info
-        hist_2d = ticker.history(period="2d")
-        change = 0
-        change_pct = 0
-        if len(hist_2d) >= 2:
-            prev_close = hist_2d['Close'].iloc[-2]
-            change = price - prev_close
-            change_pct = (change / prev_close) * 100
-            
-        high = getattr(data, 'day_high', price * 1.01)
-        low = getattr(data, 'day_low', price * 0.99)
-        
-        result = {
-            "price": price,
-            "change": change,
-            "change_percent": change_pct,
-            "high": high,
-            "low": low,
-            "volume": getattr(data, 'last_volume', 0)
-        }
-        
-        # Update cache
-        price_cache[yahoo_symbol] = (result, now)
-        return result
-    except Exception as e:
-        logger.error(f"Error getting real price for {yahoo_symbol}: {e}")
-        # If rate limited, return None so fallback kicks in
-        return None
+    # If cache is missing, trigger a batch fetch for everything
+    # This ensures we don't hit Yahoo multiple times for the list
+    batch_fetch_all_prices()
+    
+    # Return from cache if now available, else None
+    if yahoo_symbol in price_cache:
+        return price_cache[yahoo_symbol][0]
+    return None
 
 def generate_forecast_prophet(yahoo_symbol: str, days: int = 14):
     try:
