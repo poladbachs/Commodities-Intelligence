@@ -30,6 +30,7 @@ export const PriceCharts = ({ commodities }) => {
   const [historyData, setHistoryData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState("30");
+  const [hoveredData, setHoveredData] = useState(null);
 
   useEffect(() => {
     const fetchHistory = async () => {
@@ -49,6 +50,20 @@ export const PriceCharts = ({ commodities }) => {
   }, [selectedSymbol, timeRange]);
 
   const selectedCommodity = commodities.find(c => c.symbol === selectedSymbol);
+  
+  // Calculate period change based on the history data
+  const calculatePeriodChange = () => {
+    if (historyData.length < 2) return { val: 0, pct: 0 };
+    const first = historyData[0].close;
+    const last = historyData[historyData.length - 1].close;
+    const diff = last - first;
+    const pct = (diff / first) * 100;
+    return { val: diff, pct: pct, price: last };
+  };
+
+  const periodData = calculatePeriodChange();
+  const displayPrice = periodData.price || selectedCommodity?.price;
+  const displayPct = periodData.pct || selectedCommodity?.change_percent;
 
   return (
     <div className="space-y-6" data-testid="price-charts">
@@ -79,11 +94,16 @@ export const PriceCharts = ({ commodities }) => {
               </CardTitle>
               <div className="flex items-center gap-4 mt-2">
                 <span className="font-data text-3xl text-[#D4AF37]">
-                  ${selectedCommodity?.price?.toFixed(2)}
+                  ${displayPrice?.toFixed(2)}
                 </span>
-                <span className={`font-data text-lg ${selectedCommodity?.change_percent >= 0 ? 'text-[#00FF94]' : 'text-[#FF0055]'}`}>
-                  {selectedCommodity?.change_percent >= 0 ? '+' : ''}{selectedCommodity?.change_percent?.toFixed(2)}%
-                </span>
+                <div className="flex flex-col">
+                  <span className={`font-data text-lg leading-none ${displayPct >= 0 ? 'text-[#00FF94]' : 'text-[#FF0055]'}`}>
+                    {displayPct >= 0 ? '+' : ''}{displayPct?.toFixed(2)}%
+                  </span>
+                  <span className="text-[10px] text-[#52525B] uppercase mt-1">
+                    {timeRange}D Change
+                  </span>
+                </div>
               </div>
             </div>
             <Tabs value={timeRange} onValueChange={setTimeRange}>
@@ -101,7 +121,13 @@ export const PriceCharts = ({ commodities }) => {
           ) : (
             <div className="h-[400px]">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={historyData}>
+                <AreaChart 
+                  data={historyData}
+                  onMouseMove={(e) => {
+                    if (e.activePayload) setHoveredData(e.activePayload[0].payload);
+                  }}
+                  onMouseLeave={() => setHoveredData(null)}
+                >
                   <defs>
                     <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#D4AF37" stopOpacity={0.3} />
@@ -128,6 +154,7 @@ export const PriceCharts = ({ commodities }) => {
                     stroke="#D4AF37"
                     strokeWidth={2}
                     fill="url(#chartGradient)"
+                    animationDuration={1000}
                   />
                 </AreaChart>
               </ResponsiveContainer>
@@ -138,13 +165,15 @@ export const PriceCharts = ({ commodities }) => {
 
       <div className="grid grid-cols-4 gap-4">
         {["open", "high", "low", "close"].map((key) => {
-          const latestData = historyData[historyData.length - 1];
+          const displayData = hoveredData || historyData[historyData.length - 1];
           return (
-            <Card key={key} className="glass-card border-0">
+            <Card key={key} className="glass-card border-0 transition-all duration-200 hover:border-[#D4AF37]/30">
               <CardContent className="p-4">
-                <p className="text-xs text-[#52525B] uppercase tracking-wider mb-1">{key}</p>
+                <p className="text-xs text-[#52525B] uppercase tracking-wider mb-1">
+                  {hoveredData ? `Hover ${key}` : `Current ${key}`}
+                </p>
                 <p className="font-data text-xl text-[#FAFAFA]">
-                  ${latestData?.[key]?.toFixed(2) || '--'}
+                  ${displayData?.[key]?.toFixed(2) || '--'}
                 </p>
               </CardContent>
             </Card>
@@ -154,3 +183,4 @@ export const PriceCharts = ({ commodities }) => {
     </div>
   );
 };
+

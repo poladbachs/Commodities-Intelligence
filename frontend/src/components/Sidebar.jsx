@@ -57,18 +57,6 @@ export const Sidebar = ({ isOpen, setIsOpen }) => {
           </NavLink>
         ))}
       </nav>
-
-      {isOpen && (
-        <div className="absolute bottom-4 left-4 right-4">
-          <div className="glass-card rounded-lg p-4">
-            <p className="text-xs text-[#52525B] mb-1">Market Status</p>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-[#00FF94] animate-pulse" />
-              <span className="text-sm font-medium text-[#FAFAFA]">Markets Open</span>
-            </div>
-          </div>
-        </div>
-      )}
     </aside>
   );
 };
