@@ -1,7 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
@@ -20,15 +19,6 @@ import numpy as np
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-# Use short server-selection timeout so bad URLs fail fast instead of hanging 30s
-client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=3000)
-db = client[os.environ['DB_NAME']]
-
-# Only use MongoDB cache when connected to a real cluster (not localhost)
-USE_DB_CACHE = "localhost" not in mongo_url and "127.0.0.1" not in mongo_url
-
 # API Keys
 NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
 
@@ -39,9 +29,12 @@ api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# In-memory cache: { stooq_symbol: (data_dict, datetime) }
+# In-memory price cache: { stooq_symbol: (data_dict, datetime) }
 price_cache: Dict[str, Any] = {}
 CACHE_TTL = timedelta(minutes=30)
+
+# In-memory watchlist store
+watchlist_store: Dict[str, Dict] = {}
 
 # Models
 class CommodityPrice(BaseModel):
@@ -209,45 +202,17 @@ async def fetch_stooq_history(stooq_symbol: str, days: int = 90) -> Optional[pd.
 # MongoDB-backed price cache (survives cold starts / serverless resets)
 # ─────────────────────────────────────────────────────────────────────
 async def get_cached_price(stooq_symbol: str) -> Optional[Dict]:
-    """Return price from memory or MongoDB if not stale."""
+    """Return price from in-memory cache if not stale."""
     now = datetime.now(timezone.utc)
-
-    # 1. Memory cache (fastest)
     if stooq_symbol in price_cache:
         data, ts = price_cache[stooq_symbol]
         if now - ts < CACHE_TTL:
             return data
-
-    # 2. MongoDB cache (only when connected to a real cluster)
-    if USE_DB_CACHE:
-        try:
-            doc = await db.price_cache.find_one({"stooq_symbol": stooq_symbol})
-            if doc:
-                ts = doc.get("updated_at")
-                if ts and isinstance(ts, datetime):
-                    ts_aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-                    if now - ts_aware < CACHE_TTL:
-                        data = doc["data"]
-                        price_cache[stooq_symbol] = (data, now)
-                        return data
-        except Exception as e:
-            logger.warning(f"MongoDB cache read skipped: {e}")
-
     return None
 
 async def set_cached_price(stooq_symbol: str, data: Dict):
-    """Store price in memory and (if available) MongoDB."""
-    now = datetime.now(timezone.utc)
-    price_cache[stooq_symbol] = (data, now)
-    if USE_DB_CACHE:
-        try:
-            await db.price_cache.update_one(
-                {"stooq_symbol": stooq_symbol},
-                {"$set": {"data": data, "updated_at": now}},
-                upsert=True
-            )
-        except Exception as e:
-            logger.warning(f"MongoDB cache write skipped: {e}")
+    """Store price in memory."""
+    price_cache[stooq_symbol] = (data, datetime.now(timezone.utc))
 
 async def get_price(item: Dict) -> Dict:
     """
@@ -560,25 +525,23 @@ async def get_freight_routes():
 
 @api_router.get("/watchlist")
 async def get_watchlist():
-    items = await db.watchlist.find({}, {"_id": 0}).to_list(100)
-    return {"items": items}
+    return {"items": list(watchlist_store.values())}
 
 @api_router.post("/watchlist")
 async def add_to_watchlist(symbol: str, name: str, category: str):
-    existing = await db.watchlist.find_one({"symbol": symbol})
-    if existing:
+    if symbol in watchlist_store:
         raise HTTPException(status_code=400, detail="Already in watchlist")
     item = WatchlistItem(symbol=symbol, name=name, category=category)
     doc = item.model_dump()
     doc["added_at"] = doc["added_at"].isoformat()
-    await db.watchlist.insert_one(doc)
+    watchlist_store[symbol] = doc
     return {"message": "Added to watchlist", "item": doc}
 
 @api_router.delete("/watchlist/{symbol}")
 async def remove_from_watchlist(symbol: str):
-    result = await db.watchlist.delete_one({"symbol": symbol})
-    if result.deleted_count == 0:
+    if symbol not in watchlist_store:
         raise HTTPException(status_code=404, detail="Not found in watchlist")
+    del watchlist_store[symbol]
     return {"message": "Removed from watchlist"}
 
 @api_router.get("/market/summary")
@@ -616,7 +579,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()

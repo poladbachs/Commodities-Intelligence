@@ -33,7 +33,6 @@ markdown-it-py==4.0.0
 matplotlib==3.10.7
 mccabe==0.7.0
 mdurl==0.1.2
-motor==3.3.1
 mypy==1.18.2
 mypy_extensions==1.1.0
 numpy==2.3.5
@@ -54,7 +53,6 @@ pydantic_core==2.41.5
 pyflakes==3.4.0
 Pygments==2.19.2
 PyJWT==2.10.1
-pymongo==4.5.0
 pyparsing==3.2.5
 pytest==9.0.1
 python-dateutil==2.9.0.post0
