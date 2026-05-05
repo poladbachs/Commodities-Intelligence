@@ -27,19 +27,6 @@ export const Header = ({ commodities }) => {
       </div>
 
       <div className="flex items-center gap-4">
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#52525B]" size={16} />
-          <Input
-            placeholder="Search commodities..."
-            className="w-48 pl-9 bg-[#09090B] border-[#27272A] text-sm"
-            data-testid="search-input"
-          />
-        </div>
-
-        <button className="relative p-2 rounded hover:bg-[#27272A] text-[#A1A1AA] hover:text-[#FAFAFA] transition-colors" data-testid="notifications-btn">
-          <Bell size={20} />
-          <span className="absolute top-1 right-1 w-2 h-2 bg-[#FF0055] rounded-full" />
-        </button>
 
         <div className="text-right">
           <p className="font-data text-sm text-[#FAFAFA]">
