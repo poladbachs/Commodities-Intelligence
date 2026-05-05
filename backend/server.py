@@ -11,6 +11,10 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import httpx
 import random
+import yfinance as yf
+from prophet import Prophet
+import pandas as pd
+import numpy as np
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -79,23 +83,23 @@ class WatchlistItem(BaseModel):
 # Commodity definitions
 COMMODITIES = {
     "energy": [
-        {"symbol": "WTI", "name": "WTI Crude Oil", "base_price": 78.50, "av_symbol": "WTI"},
-        {"symbol": "BRENT", "name": "Brent Crude", "base_price": 82.30, "av_symbol": "BRENT"},
-        {"symbol": "NG", "name": "Natural Gas", "base_price": 2.85, "av_symbol": "NATURAL_GAS"},
+        {"symbol": "WTI", "name": "WTI Crude Oil", "base_price": 78.50, "yahoo_symbol": "CL=F"},
+        {"symbol": "BRENT", "name": "Brent Crude", "base_price": 82.30, "yahoo_symbol": "BZ=F"},
+        {"symbol": "NG", "name": "Natural Gas", "base_price": 2.85, "yahoo_symbol": "NG=F"},
     ],
     "precious_metals": [
-        {"symbol": "XAU", "name": "Gold", "base_price": 2035.50, "av_symbol": "XAU"},
-        {"symbol": "XAG", "name": "Silver", "base_price": 23.45, "av_symbol": "XAG"},
-        {"symbol": "XPT", "name": "Platinum", "base_price": 895.20, "av_symbol": "XPT"},
+        {"symbol": "XAU", "name": "Gold", "base_price": 2035.50, "yahoo_symbol": "GC=F"},
+        {"symbol": "XAG", "name": "Silver", "base_price": 23.45, "yahoo_symbol": "SI=F"},
+        {"symbol": "XPT", "name": "Platinum", "base_price": 895.20, "yahoo_symbol": "PL=F"},
     ],
     "industrial_metals": [
-        {"symbol": "HG", "name": "Copper", "base_price": 3.85, "av_symbol": "COPPER"},
-        {"symbol": "ALI", "name": "Aluminum", "base_price": 2245.00, "av_symbol": "ALUMINUM"},
+        {"symbol": "HG", "name": "Copper", "base_price": 3.85, "yahoo_symbol": "HG=F"},
+        {"symbol": "ALI", "name": "Aluminum", "base_price": 2245.00, "yahoo_symbol": "ALI=F"},
     ],
     "agriculture": [
-        {"symbol": "ZW", "name": "Wheat", "base_price": 5.82, "av_symbol": "WHEAT"},
-        {"symbol": "ZC", "name": "Corn", "base_price": 4.35, "av_symbol": "CORN"},
-        {"symbol": "KC", "name": "Coffee", "base_price": 185.50, "av_symbol": "COFFEE"},
+        {"symbol": "ZW", "name": "Wheat", "base_price": 5.82, "yahoo_symbol": "ZW=F"},
+        {"symbol": "ZC", "name": "Corn", "base_price": 4.35, "yahoo_symbol": "ZC=F"},
+        {"symbol": "KC", "name": "Coffee", "base_price": 185.50, "yahoo_symbol": "KC=F"},
     ]
 }
 
@@ -108,39 +112,128 @@ FREIGHT_ROUTES = {
     ("Sydney", "Tokyo"): {"distance": 7800, "base_rate": 42, "days": 12},
 }
 
+def get_commodity_by_symbol(symbol: str):
+    for category, items in COMMODITIES.items():
+        for item in items:
+            if item["symbol"] == symbol.upper():
+                return item, category
+    return None, None
+
+def get_real_price(yahoo_symbol: str):
+    try:
+        ticker = yf.Ticker(yahoo_symbol)
+        data = ticker.fast_info
+        # Sometimes fast_info is not enough, get latest price
+        price = data.last_price
+        if not price or np.isnan(price):
+            # Fallback to history
+            hist = ticker.history(period="1d")
+            if not hist.empty:
+                price = hist['Close'].iloc[-1]
+        
+        # Get change info
+        hist_2d = ticker.history(period="2d")
+        change = 0
+        change_pct = 0
+        if len(hist_2d) >= 2:
+            prev_close = hist_2d['Close'].iloc[-2]
+            change = price - prev_close
+            change_pct = (change / prev_close) * 100
+            
+        high = data.get('day_high', price * 1.01)
+        low = data.get('day_low', price * 0.99)
+        
+        return {
+            "price": price,
+            "change": change,
+            "change_percent": change_pct,
+            "high": high,
+            "low": low,
+            "volume": getattr(data, 'last_volume', 0)
+        }
+    except Exception as e:
+        logger.error(f"Error getting real price for {yahoo_symbol}: {e}")
+        return None
+
+def generate_forecast_prophet(yahoo_symbol: str, days: int = 14):
+    try:
+        ticker = yf.Ticker(yahoo_symbol)
+        # Get 2 years of data for better seasonality
+        df = ticker.history(period="2y")
+        if df.empty or len(df) < 30:
+            return None
+            
+        # Prepare for Prophet
+        pdf = df.reset_index()[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
+        pdf['ds'] = pdf['ds'].dt.tz_localize(None)
+        
+        # Suppress prophet logs
+        logging.getLogger('prophet').setLevel(logging.WARNING)
+        logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
+        
+        model = Prophet(
+            daily_seasonality=False,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            interval_width=0.95
+        )
+        model.fit(pdf)
+        
+        future = model.make_future_dataframe(periods=days)
+        forecast = model.predict(future)
+        
+        # Extract future part
+        future_part = forecast.tail(days)
+        
+        results = []
+        for _, row in future_part.iterrows():
+            results.append({
+                "date": row['ds'].strftime("%Y-%m-%d"),
+                "predicted": round(float(row['yhat']), 2),
+                "lower_bound": round(float(row['yhat_lower']), 2),
+                "upper_bound": round(float(row['yhat_upper']), 2)
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Prophet forecast error for {yahoo_symbol}: {e}")
+        return None
+
 def generate_price_variation(base_price: float) -> tuple:
-    change_pct = random.uniform(-3.5, 3.5)
+    # Fallback function if Yahoo fails
+    change_pct = random.uniform(-2.0, 2.0)
     change = base_price * (change_pct / 100)
     current = base_price + change
-    high = current * (1 + random.uniform(0.005, 0.02))
-    low = current * (1 - random.uniform(0.005, 0.02))
+    high = current * (1 + random.uniform(0.002, 0.01))
+    low = current * (1 - random.uniform(0.002, 0.01))
     return current, change, change_pct, high, low
 
 def generate_historical_prices(base_price: float, days: int = 30) -> List[Dict]:
+    # Fallback historical data
     prices = []
     current = base_price
     for i in range(days, 0, -1):
         date = datetime.now(timezone.utc) - timedelta(days=i)
-        change = random.uniform(-0.02, 0.02)
+        change = random.uniform(-0.015, 0.015)
         current = current * (1 + change)
         prices.append({
             "date": date.strftime("%Y-%m-%d"),
-            "open": round(current * 0.998, 2),
+            "open": round(current * 0.995, 2),
             "high": round(current * 1.01, 2),
             "low": round(current * 0.99, 2),
             "close": round(current, 2),
-            "volume": random.randint(50000, 500000)
+            "volume": random.randint(100000, 1000000)
         })
     return prices
 
 def generate_forecast(base_price: float, days: int = 14) -> List[Dict]:
+    # Fallback forecast
     forecasts = []
     current = base_price
     for i in range(1, days + 1):
         date = datetime.now(timezone.utc) + timedelta(days=i)
-        trend = random.uniform(-0.008, 0.012)
+        trend = random.uniform(-0.005, 0.008)
         current = current * (1 + trend)
-        uncertainty = 0.02 + (i * 0.003)
+        uncertainty = 0.01 + (i * 0.002)
         forecasts.append({
             "date": date.strftime("%Y-%m-%d"),
             "predicted": round(current, 2),
@@ -159,15 +252,19 @@ async def get_all_commodities():
     result = []
     for category, items in COMMODITIES.items():
         for item in items:
-            price, change, change_pct, high, low = generate_price_variation(item["base_price"])
+            data = get_real_price(item["yahoo_symbol"])
+            if not data:
+                price, change, change_pct, high, low = generate_price_variation(item["base_price"])
+                data = {"price": price, "change": change, "change_percent": change_pct, "high": high, "low": low}
+            
             result.append({
                 "symbol": item["symbol"],
                 "name": item["name"],
-                "price": round(price, 2),
-                "change": round(change, 2),
-                "change_percent": round(change_pct, 2),
-                "high": round(high, 2),
-                "low": round(low, 2),
+                "price": round(data["price"], 2),
+                "change": round(data["change"], 2),
+                "change_percent": round(data["change_percent"], 2),
+                "high": round(data["high"], 2),
+                "low": round(data["low"], 2),
                 "category": category,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
@@ -175,48 +272,74 @@ async def get_all_commodities():
 
 @api_router.get("/commodities/{symbol}")
 async def get_commodity_detail(symbol: str):
-    for category, items in COMMODITIES.items():
-        for item in items:
-            if item["symbol"] == symbol.upper():
-                price, change, change_pct, high, low = generate_price_variation(item["base_price"])
-                return {
-                    "symbol": item["symbol"],
-                    "name": item["name"],
-                    "price": round(price, 2),
-                    "change": round(change, 2),
-                    "change_percent": round(change_pct, 2),
-                    "high": round(high, 2),
-                    "low": round(low, 2),
-                    "category": category,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
+    item, category = get_commodity_by_symbol(symbol)
+    if item:
+        data = get_real_price(item["yahoo_symbol"])
+        if not data:
+            price, change, change_pct, high, low = generate_price_variation(item["base_price"])
+            data = {"price": price, "change": change, "change_percent": change_pct, "high": high, "low": low}
+            
+        return {
+            "symbol": item["symbol"],
+            "name": item["name"],
+            "price": round(data["price"], 2),
+            "change": round(data["change"], 2),
+            "change_percent": round(data["change_percent"], 2),
+            "high": round(data["high"], 2),
+            "low": round(data["low"], 2),
+            "category": category,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
     raise HTTPException(status_code=404, detail="Commodity not found")
 
 @api_router.get("/commodities/{symbol}/history")
 async def get_commodity_history(symbol: str, days: int = 30):
-    for category, items in COMMODITIES.items():
-        for item in items:
-            if item["symbol"] == symbol.upper():
-                history = generate_historical_prices(item["base_price"], days)
-                return {
-                    "symbol": item["symbol"],
-                    "name": item["name"],
-                    "history": history
-                }
+    item, category = get_commodity_by_symbol(symbol)
+    if item:
+        try:
+            ticker = yf.Ticker(item["yahoo_symbol"])
+            df = ticker.history(period=f"{days}d")
+            if not df.empty:
+                history = []
+                for idx, row in df.iterrows():
+                    history.append({
+                        "date": idx.strftime("%Y-%m-%d"),
+                        "open": round(float(row['Open']), 2),
+                        "high": round(float(row['High']), 2),
+                        "low": round(float(row['Low']), 2),
+                        "close": round(float(row['Close']), 2),
+                        "volume": int(row['Volume'])
+                    })
+                return {"symbol": item["symbol"], "name": item["name"], "history": history}
+        except Exception as e:
+            logger.error(f"History fetch error: {e}")
+            
+        # Fallback
+        history = generate_historical_prices(item["base_price"], days)
+        return {"symbol": item["symbol"], "name": item["name"], "history": history}
     raise HTTPException(status_code=404, detail="Commodity not found")
 
 @api_router.get("/commodities/{symbol}/forecast")
 async def get_commodity_forecast(symbol: str, days: int = 14):
-    for category, items in COMMODITIES.items():
-        for item in items:
-            if item["symbol"] == symbol.upper():
-                forecast = generate_forecast(item["base_price"], days)
-                return {
-                    "symbol": item["symbol"],
-                    "name": item["name"],
-                    "forecast": forecast,
-                    "model": "Prophet-based statistical forecast"
-                }
+    item, category = get_commodity_by_symbol(symbol)
+    if item:
+        forecast = generate_forecast_prophet(item["yahoo_symbol"], days)
+        if forecast:
+            return {
+                "symbol": item["symbol"],
+                "name": item["name"],
+                "forecast": forecast,
+                "model": "Prophet-based ML Model"
+            }
+        
+        # Fallback
+        forecast = generate_forecast(item["base_price"], days)
+        return {
+            "symbol": item["symbol"],
+            "name": item["name"],
+            "forecast": forecast,
+            "model": "Statistical Fallback"
+        }
     raise HTTPException(status_code=404, detail="Commodity not found")
 
 @api_router.get("/news")
@@ -351,12 +474,16 @@ async def get_market_summary():
     commodities = []
     for category, items in COMMODITIES.items():
         for item in items:
-            price, change, change_pct, high, low = generate_price_variation(item["base_price"])
+            data = get_real_price(item["yahoo_symbol"])
+            if not data:
+                price, change, change_pct, high, low = generate_price_variation(item["base_price"])
+                data = {"price": price, "change": change, "change_percent": change_pct}
+            
             commodities.append({
                 "symbol": item["symbol"],
                 "name": item["name"],
-                "price": round(price, 2),
-                "change_percent": round(change_pct, 2),
+                "price": round(data["price"], 2),
+                "change_percent": round(data["change_percent"], 2),
                 "category": category
             })
     
