@@ -19,6 +19,16 @@ import numpy as np
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Set yfinance cache to a writable directory for Vercel
+try:
+    yf.set_tz_cache_location("/tmp/py-yfinance")
+except Exception:
+    pass
+
+# Simple in-memory cache for prices
+price_cache = {}
+CACHE_EXPIRATION = timedelta(minutes=5)
+
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -120,17 +130,29 @@ def get_commodity_by_symbol(symbol: str):
     return None, None
 
 def get_real_price(yahoo_symbol: str):
+    # Check cache first
+    now = datetime.now()
+    if yahoo_symbol in price_cache:
+        cached_data, timestamp = price_cache[yahoo_symbol]
+        if now - timestamp < CACHE_EXPIRATION:
+            return cached_data
+
     try:
         ticker = yf.Ticker(yahoo_symbol)
         data = ticker.fast_info
-        # Sometimes fast_info is not enough, get latest price
-        price = data.last_price
+        
+        # Use fast_info properties instead of dictionary access for better compatibility
+        price = getattr(data, 'last_price', None)
+        
         if not price or np.isnan(price):
             # Fallback to history
             hist = ticker.history(period="1d")
             if not hist.empty:
                 price = hist['Close'].iloc[-1]
         
+        if not price:
+            return None
+
         # Get change info
         hist_2d = ticker.history(period="2d")
         change = 0
@@ -140,10 +162,10 @@ def get_real_price(yahoo_symbol: str):
             change = price - prev_close
             change_pct = (change / prev_close) * 100
             
-        high = data.get('day_high', price * 1.01)
-        low = data.get('day_low', price * 0.99)
+        high = getattr(data, 'day_high', price * 1.01)
+        low = getattr(data, 'day_low', price * 0.99)
         
-        return {
+        result = {
             "price": price,
             "change": change,
             "change_percent": change_pct,
@@ -151,8 +173,13 @@ def get_real_price(yahoo_symbol: str):
             "low": low,
             "volume": getattr(data, 'last_volume', 0)
         }
+        
+        # Update cache
+        price_cache[yahoo_symbol] = (result, now)
+        return result
     except Exception as e:
         logger.error(f"Error getting real price for {yahoo_symbol}: {e}")
+        # If rate limited, return None so fallback kicks in
         return None
 
 def generate_forecast_prophet(yahoo_symbol: str, days: int = 14):
