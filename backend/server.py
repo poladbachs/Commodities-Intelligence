@@ -82,28 +82,37 @@ class WatchlistItem(BaseModel):
     added_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # ─────────────────────────────────────────────────────────────────────
-# Commodity definitions – stooq_symbol is the Stooq ticker
-# Stooq uses lowercase futures symbols with a dot: cl.f, gc.f, etc.
+# Commodity definitions
+# stooq: Stooq ticker symbol
+# mult:  unit multiplier to convert raw Stooq value → USD display price
+#        COMEX silver/copper in cents/oz or cents/lb → mult=0.01
+#        CBOT wheat/corn/coffee in cents/bushel or cents/lb → mult=0.01
+#        Everything else already in USD → mult=1.0
+# base_price: realistic fallback in USD (updated May 2026)
 # ─────────────────────────────────────────────────────────────────────
 COMMODITIES = {
     "energy": [
-        {"symbol": "WTI",   "name": "WTI Crude Oil",  "base_price": 78.50,   "stooq": "cl.f"},
-        {"symbol": "BRENT", "name": "Brent Crude",     "base_price": 82.30,   "stooq": "cb.f"},
-        {"symbol": "NG",    "name": "Natural Gas",     "base_price": 2.85,    "stooq": "ng.f"},
+        {"symbol": "WTI",   "name": "WTI Crude Oil",  "stooq": "cl.f",    "mult": 1.0,  "base_price": 60.0},
+        {"symbol": "BRENT", "name": "Brent Crude",     "stooq": "cb.f",    "mult": 1.0,  "base_price": 63.0},
+        {"symbol": "NG",    "name": "Natural Gas",     "stooq": "ng.f",    "mult": 1.0,  "base_price": 3.20},
     ],
     "precious_metals": [
-        {"symbol": "XAU",   "name": "Gold",            "base_price": 2035.50, "stooq": "gc.f"},
-        {"symbol": "XAG",   "name": "Silver",          "base_price": 23.45,   "stooq": "si.f"},
-        {"symbol": "XPT",   "name": "Platinum",        "base_price": 895.20,  "stooq": "pl.f"},
+        # Use spot forex rates – always in USD, no contract rollover issues
+        {"symbol": "XAU",   "name": "Gold",            "stooq": "xauusd",  "mult": 1.0,  "base_price": 3250.0},
+        {"symbol": "XAG",   "name": "Silver",          "stooq": "xagusd",  "mult": 1.0,  "base_price": 32.50},
+        {"symbol": "XPT",   "name": "Platinum",        "stooq": "xptusd",  "mult": 1.0,  "base_price": 1000.0},
     ],
     "industrial_metals": [
-        {"symbol": "HG",    "name": "Copper",          "base_price": 3.85,    "stooq": "hg.f"},
-        {"symbol": "ALI",   "name": "Aluminum",        "base_price": 2245.00, "stooq": "q8.f"},
+        # HG = COMEX copper in cents/lb → mult 0.01 gives $/lb
+        {"symbol": "HG",    "name": "Copper",          "stooq": "hg.f",    "mult": 0.01, "base_price": 4.70},
+        # Aluminum LME in USD/tonne
+        {"symbol": "ALI",   "name": "Aluminum",        "stooq": "q8.f",    "mult": 1.0,  "base_price": 2400.0},
     ],
     "agriculture": [
-        {"symbol": "ZW",    "name": "Wheat",           "base_price": 5.82,    "stooq": "zw.f"},
-        {"symbol": "ZC",    "name": "Corn",            "base_price": 4.35,    "stooq": "zc.f"},
-        {"symbol": "KC",    "name": "Coffee",          "base_price": 185.50,  "stooq": "kc.f"},
+        # CBOT wheat/corn in cents/bushel, coffee in cents/lb → mult 0.01
+        {"symbol": "ZW",    "name": "Wheat",           "stooq": "zw.f",    "mult": 0.01, "base_price": 5.50},
+        {"symbol": "ZC",    "name": "Corn",            "stooq": "zc.f",    "mult": 0.01, "base_price": 4.50},
+        {"symbol": "KC",    "name": "Coffee",          "stooq": "kc.f",    "mult": 0.01, "base_price": 2.50},
     ]
 }
 
@@ -216,31 +225,60 @@ async def set_cached_price(stooq_symbol: str, data: Dict):
 
 async def get_price(item: Dict) -> Dict:
     """
-    Get live price for a commodity.
-    1. Memory cache → 2. MongoDB cache → 3. Stooq live fetch → 4. Fallback
+    Get current price derived from the last bar of recent Stooq history.
+    This guarantees the ticker and chart always show the same data source.
     """
     stooq = item["stooq"]
+    mult  = item.get("mult", 1.0)
+
     cached = await get_cached_price(stooq)
     if cached:
         return cached
 
-    # Fetch from Stooq
-    data = await fetch_stooq_quote(stooq)
-    if data:
-        await set_cached_price(stooq, data)
-        return data
+    # Fetch recent history and take the last two bars
+    df = await fetch_stooq_history(stooq, days=10)
+    if df is not None and not df.empty:
+        # Numeric-ify all OHLC columns
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Close"])
+
+        if not df.empty:
+            last = df.iloc[-1]
+            price  = float(last["Close"]) * mult
+            high   = float(last.get("High",  last["Close"])) * mult
+            low    = float(last.get("Low",   last["Close"])) * mult
+            volume = int(float(last.get("Volume", 0) or 0))
+
+            change, change_pct = 0.0, 0.0
+            if len(df) >= 2:
+                prev = float(df.iloc[-2]["Close"]) * mult
+                change = price - prev
+                change_pct = (change / prev * 100) if prev else 0.0
+
+            result = {
+                "price": round(price, 4),
+                "change": round(change, 4),
+                "change_percent": round(change_pct, 4),
+                "high": round(high, 4),
+                "low": round(low, 4),
+                "volume": volume,
+            }
+            await set_cached_price(stooq, result)
+            return result
 
     # Fallback: realistic variation on base price
     bp = item["base_price"]
-    change_pct = random.uniform(-1.5, 1.5)
+    change_pct = random.uniform(-1.0, 1.0)
     change = bp * change_pct / 100
-    price = bp + change
+    price  = bp + change
     return {
-        "price": round(price, 2),
+        "price": round(price, 4),
         "change": round(change, 4),
         "change_percent": round(change_pct, 4),
-        "high": round(price * 1.008, 2),
-        "low": round(price * 0.992, 2),
+        "high": round(price * 1.005, 4),
+        "low": round(price * 0.995, 4),
         "volume": 0,
     }
 
@@ -382,19 +420,25 @@ async def get_commodity_history(symbol: str, days: int = 30):
     if not item:
         raise HTTPException(status_code=404, detail="Commodity not found")
 
+    mult = item.get("mult", 1.0)
     df = await fetch_stooq_history(item["stooq"], days=max(days, 30))
     if df is not None and not df.empty:
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Close"])
         history = []
         for _, row in df.tail(days).iterrows():
             history.append({
                 "date": str(row["Date"])[:10],
-                "open":  round(float(row.get("Open",  row["Close"])), 2),
-                "high":  round(float(row.get("High",  row["Close"])), 2),
-                "low":   round(float(row.get("Low",   row["Close"])), 2),
-                "close": round(float(row["Close"]), 2),
+                "open":  round(float(row.get("Open",  row["Close"])) * mult, 4),
+                "high":  round(float(row.get("High",  row["Close"])) * mult, 4),
+                "low":   round(float(row.get("Low",   row["Close"])) * mult, 4),
+                "close": round(float(row["Close"]) * mult, 4),
                 "volume": int(float(row.get("Volume", 0) or 0)),
             })
-        return {"symbol": item["symbol"], "name": item["name"], "history": history}
+        if history:
+            return {"symbol": item["symbol"], "name": item["name"], "history": history}
 
     # Fallback
     history = generate_historical_prices(item["base_price"], days)
@@ -406,10 +450,18 @@ async def get_commodity_forecast(symbol: str, days: int = 14):
     if not item:
         raise HTTPException(status_code=404, detail="Commodity not found")
 
-    # Try Prophet with real historical data (2 years)
+    mult = item.get("mult", 1.0)
+    # Try Prophet with 2 years of real historical data
     df = await fetch_stooq_history(item["stooq"], days=730)
     if df is not None and len(df) >= 30:
-        fc = generate_prophet_forecast(df, days)
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Close"])
+        # Scale to USD before fitting Prophet
+        df_scaled = df.copy()
+        df_scaled["Close"] = df_scaled["Close"] * mult
+        fc = generate_prophet_forecast(df_scaled, days)
         if fc:
             return {
                 "symbol": item["symbol"],
