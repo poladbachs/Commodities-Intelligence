@@ -11,7 +11,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import httpx
 import random
-import yfinance as yf
+import io
+import csv
 from prophet import Prophet
 import pandas as pd
 import numpy as np
@@ -19,23 +20,12 @@ import numpy as np
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# Set yfinance cache to a writable directory for Vercel
-try:
-    yf.set_tz_cache_location("/tmp/py-yfinance")
-except Exception:
-    pass
-
-# Simple in-memory cache for prices
-price_cache = {}
-CACHE_EXPIRATION = timedelta(minutes=5)
-
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[os.environ['DB_NAME']]\
 
 # API Keys
-AV_API_KEY = os.environ.get('AV_API_KEY', '')
 NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
 
 app = FastAPI(title="Commodities Analytics Dashboard API")
@@ -44,6 +34,10 @@ api_router = APIRouter(prefix="/api")
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# In-memory cache: { stooq_symbol: (data_dict, datetime) }
+price_cache: Dict[str, Any] = {}
+CACHE_TTL = timedelta(minutes=30)
 
 # Models
 class CommodityPrice(BaseModel):
@@ -90,38 +84,177 @@ class WatchlistItem(BaseModel):
     category: str
     added_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-# Commodity definitions
+# ─────────────────────────────────────────────────────────────────────
+# Commodity definitions – stooq_symbol is the Stooq ticker
+# Stooq uses lowercase futures symbols with a dot: cl.f, gc.f, etc.
+# ─────────────────────────────────────────────────────────────────────
 COMMODITIES = {
     "energy": [
-        {"symbol": "WTI", "name": "WTI Crude Oil", "base_price": 78.50, "yahoo_symbol": "CL=F"},
-        {"symbol": "BRENT", "name": "Brent Crude", "base_price": 82.30, "yahoo_symbol": "BZ=F"},
-        {"symbol": "NG", "name": "Natural Gas", "base_price": 2.85, "yahoo_symbol": "NG=F"},
+        {"symbol": "WTI",   "name": "WTI Crude Oil",  "base_price": 78.50,   "stooq": "cl.f"},
+        {"symbol": "BRENT", "name": "Brent Crude",     "base_price": 82.30,   "stooq": "lco.f"},
+        {"symbol": "NG",    "name": "Natural Gas",     "base_price": 2.85,    "stooq": "ng.f"},
     ],
     "precious_metals": [
-        {"symbol": "XAU", "name": "Gold", "base_price": 2035.50, "yahoo_symbol": "GC=F"},
-        {"symbol": "XAG", "name": "Silver", "base_price": 23.45, "yahoo_symbol": "SI=F"},
-        {"symbol": "XPT", "name": "Platinum", "base_price": 895.20, "yahoo_symbol": "PL=F"},
+        {"symbol": "XAU",   "name": "Gold",            "base_price": 2035.50, "stooq": "gc.f"},
+        {"symbol": "XAG",   "name": "Silver",          "base_price": 23.45,   "stooq": "si.f"},
+        {"symbol": "XPT",   "name": "Platinum",        "base_price": 895.20,  "stooq": "pl.f"},
     ],
     "industrial_metals": [
-        {"symbol": "HG", "name": "Copper", "base_price": 3.85, "yahoo_symbol": "HG=F"},
-        {"symbol": "ALI", "name": "Aluminum", "base_price": 2245.00, "yahoo_symbol": "ALI=F"},
+        {"symbol": "HG",    "name": "Copper",          "base_price": 3.85,    "stooq": "hg.f"},
+        {"symbol": "ALI",   "name": "Aluminum",        "base_price": 2245.00, "stooq": "ali.f"},
     ],
     "agriculture": [
-        {"symbol": "ZW", "name": "Wheat", "base_price": 5.82, "yahoo_symbol": "ZW=F"},
-        {"symbol": "ZC", "name": "Corn", "base_price": 4.35, "yahoo_symbol": "ZC=F"},
-        {"symbol": "KC", "name": "Coffee", "base_price": 185.50, "yahoo_symbol": "KC=F"},
+        {"symbol": "ZW",    "name": "Wheat",           "base_price": 5.82,    "stooq": "zw.f"},
+        {"symbol": "ZC",    "name": "Corn",            "base_price": 4.35,    "stooq": "zc.f"},
+        {"symbol": "KC",    "name": "Coffee",          "base_price": 185.50,  "stooq": "kc.f"},
     ]
 }
 
 # Freight routes
 FREIGHT_ROUTES = {
-    ("Houston", "Rotterdam"): {"distance": 8500, "base_rate": 45, "days": 18},
-    ("Singapore", "Los Angeles"): {"distance": 14500, "base_rate": 55, "days": 25},
-    ("Dubai", "Shanghai"): {"distance": 6200, "base_rate": 40, "days": 14},
-    ("Lagos", "Mumbai"): {"distance": 7800, "base_rate": 48, "days": 16},
-    ("Sydney", "Tokyo"): {"distance": 7800, "base_rate": 42, "days": 12},
+    ("Houston", "Rotterdam"):      {"distance": 8500,  "base_rate": 45, "days": 18},
+    ("Singapore", "Los Angeles"):  {"distance": 14500, "base_rate": 55, "days": 25},
+    ("Dubai", "Shanghai"):         {"distance": 6200,  "base_rate": 40, "days": 14},
+    ("Lagos", "Mumbai"):           {"distance": 7800,  "base_rate": 48, "days": 16},
+    ("Sydney", "Tokyo"):           {"distance": 7800,  "base_rate": 42, "days": 12},
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# Stooq data fetcher – no auth, no IP blocking, free
+# ─────────────────────────────────────────────────────────────────────
+STOOQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; CommoditiesBot/1.0)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+async def fetch_stooq_quote(stooq_symbol: str) -> Optional[Dict]:
+    """Fetch latest quote for a single symbol from Stooq CSV endpoint."""
+    url = f"https://stooq.com/q/l/?s={stooq_symbol}&f=sd2t2ohlcv&h&e=csv"
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=STOOQ_HEADERS) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            text = resp.text.strip()
+            reader = csv.DictReader(io.StringIO(text))
+            rows = list(reader)
+            if not rows:
+                return None
+            row = rows[-1]  # most recent row
+            close = float(row.get("Close", 0) or 0)
+            open_ = float(row.get("Open", close) or close)
+            high  = float(row.get("High", close) or close)
+            low   = float(row.get("Low",  close) or close)
+            vol   = int(float(row.get("Volume", 0) or 0))
+            if close == 0:
+                return None
+            change = close - open_
+            change_pct = (change / open_ * 100) if open_ else 0
+            return {
+                "price": close,
+                "change": round(change, 4),
+                "change_percent": round(change_pct, 4),
+                "high": high,
+                "low": low,
+                "volume": vol,
+            }
+    except Exception as e:
+        logger.error(f"Stooq fetch error for {stooq_symbol}: {e}")
+        return None
+
+async def fetch_stooq_history(stooq_symbol: str, days: int = 90) -> Optional[pd.DataFrame]:
+    """Fetch historical OHLCV from Stooq CSV endpoint."""
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    to_date   = datetime.now().strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&d1={from_date}&d2={to_date}&i=d"
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=STOOQ_HEADERS) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            if df.empty or "Date" not in df.columns:
+                return None
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date").reset_index(drop=True)
+            return df
+    except Exception as e:
+        logger.error(f"Stooq history error for {stooq_symbol}: {e}")
+        return None
+
+# ─────────────────────────────────────────────────────────────────────
+# MongoDB-backed price cache (survives cold starts / serverless resets)
+# ─────────────────────────────────────────────────────────────────────
+async def get_cached_price(stooq_symbol: str) -> Optional[Dict]:
+    """Return price from memory or MongoDB if not stale."""
+    now = datetime.now(timezone.utc)
+
+    # 1. Memory cache
+    if stooq_symbol in price_cache:
+        data, ts = price_cache[stooq_symbol]
+        if now - ts < CACHE_TTL:
+            return data
+
+    # 2. MongoDB cache
+    try:
+        doc = await db.price_cache.find_one({"stooq_symbol": stooq_symbol})
+        if doc:
+            ts = doc.get("updated_at")
+            if ts and isinstance(ts, datetime):
+                ts_aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                if now - ts_aware < CACHE_TTL:
+                    data = doc["data"]
+                    price_cache[stooq_symbol] = (data, now)
+                    return data
+    except Exception as e:
+        logger.error(f"MongoDB cache read error: {e}")
+
+    return None
+
+async def set_cached_price(stooq_symbol: str, data: Dict):
+    """Store price in memory and MongoDB."""
+    now = datetime.now(timezone.utc)
+    price_cache[stooq_symbol] = (data, now)
+    try:
+        await db.price_cache.update_one(
+            {"stooq_symbol": stooq_symbol},
+            {"$set": {"data": data, "updated_at": now}},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"MongoDB cache write error: {e}")
+
+async def get_price(item: Dict) -> Dict:
+    """
+    Get live price for a commodity.
+    1. Memory cache → 2. MongoDB cache → 3. Stooq live fetch → 4. Fallback
+    """
+    stooq = item["stooq"]
+    cached = await get_cached_price(stooq)
+    if cached:
+        return cached
+
+    # Fetch from Stooq
+    data = await fetch_stooq_quote(stooq)
+    if data:
+        await set_cached_price(stooq, data)
+        return data
+
+    # Fallback: realistic variation on base price
+    bp = item["base_price"]
+    change_pct = random.uniform(-1.5, 1.5)
+    change = bp * change_pct / 100
+    price = bp + change
+    return {
+        "price": round(price, 2),
+        "change": round(change, 4),
+        "change_percent": round(change_pct, 4),
+        "high": round(price * 1.008, 2),
+        "low": round(price * 0.992, 2),
+        "volume": 0,
+    }
+
+# ─────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────
 def get_commodity_by_symbol(symbol: str):
     for category, items in COMMODITIES.items():
         for item in items:
@@ -129,156 +262,87 @@ def get_commodity_by_symbol(symbol: str):
                 return item, category
     return None, None
 
-def batch_fetch_all_prices():
-    """Fetches all commodity prices in a single batch request to avoid rate limits."""
-    now = datetime.now()
-    all_symbols = []
-    for items in COMMODITIES.values():
-        for item in items:
-            all_symbols.append(item["yahoo_symbol"])
-    
-    try:
-        # Download all at once - 1 request instead of 11
-        data = yf.download(all_symbols, period="2d", interval="1d", group_by='ticker', progress=False)
-        
-        for symbol in all_symbols:
-            try:
-                if symbol in data.columns.get_level_values(0):
-                    ticker_df = data[symbol]
-                    if not ticker_df.empty:
-                        # Get latest valid price
-                        valid_data = ticker_df.dropna(subset=['Close'])
-                        if not valid_data.empty:
-                            last_row = valid_data.iloc[-1]
-                            price = float(last_row['Close'])
-                            
-                            # Calculate change
-                            change = 0
-                            change_pct = 0
-                            if len(valid_data) >= 2:
-                                prev_price = float(valid_data.iloc[-2]['Close'])
-                                change = price - prev_price
-                                change_pct = (change / prev_price) * 100
-                            
-                            result = {
-                                "price": price,
-                                "change": change,
-                                "change_percent": change_pct,
-                                "high": float(last_row['High']),
-                                "low": float(last_row['Low']),
-                                "volume": int(last_row['Volume'])
-                            }
-                            price_cache[symbol] = (result, now)
-            except Exception as e:
-                logger.error(f"Error processing batch item {symbol}: {e}")
-    except Exception as e:
-        logger.error(f"Batch fetch failed: {e}")
-
-def get_real_price(yahoo_symbol: str):
-    # Check cache first
-    now = datetime.now()
-    if yahoo_symbol in price_cache:
-        cached_data, timestamp = price_cache[yahoo_symbol]
-        if now - timestamp < CACHE_EXPIRATION:
-            return cached_data
-
-    # If cache is missing, trigger a batch fetch for everything
-    # This ensures we don't hit Yahoo multiple times for the list
-    batch_fetch_all_prices()
-    
-    # Return from cache if now available, else None
-    if yahoo_symbol in price_cache:
-        return price_cache[yahoo_symbol][0]
-    return None
-
-def generate_forecast_prophet(yahoo_symbol: str, days: int = 14):
-    try:
-        ticker = yf.Ticker(yahoo_symbol)
-        # Get 2 years of data for better seasonality
-        df = ticker.history(period="2y")
-        if df.empty or len(df) < 30:
-            return None
-            
-        # Prepare for Prophet
-        pdf = df.reset_index()[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
-        pdf['ds'] = pdf['ds'].dt.tz_localize(None)
-        
-        # Suppress prophet logs
-        logging.getLogger('prophet').setLevel(logging.WARNING)
-        logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
-        
-        model = Prophet(
-            daily_seasonality=False,
-            weekly_seasonality=True,
-            yearly_seasonality=True,
-            interval_width=0.95
-        )
-        model.fit(pdf)
-        
-        future = model.make_future_dataframe(periods=days)
-        forecast = model.predict(future)
-        
-        # Extract future part
-        future_part = forecast.tail(days)
-        
-        results = []
-        for _, row in future_part.iterrows():
-            results.append({
-                "date": row['ds'].strftime("%Y-%m-%d"),
-                "predicted": round(float(row['yhat']), 2),
-                "lower_bound": round(float(row['yhat_lower']), 2),
-                "upper_bound": round(float(row['yhat_upper']), 2)
-            })
-        return results
-    except Exception as e:
-        logger.error(f"Prophet forecast error for {yahoo_symbol}: {e}")
-        return None
-
-def generate_price_variation(base_price: float) -> tuple:
-    # Fallback function if Yahoo fails
-    change_pct = random.uniform(-2.0, 2.0)
-    change = base_price * (change_pct / 100)
-    current = base_price + change
-    high = current * (1 + random.uniform(0.002, 0.01))
-    low = current * (1 - random.uniform(0.002, 0.01))
-    return current, change, change_pct, high, low
-
 def generate_historical_prices(base_price: float, days: int = 30) -> List[Dict]:
-    # Fallback historical data
+    """Realistic fallback historical data using a random walk."""
     prices = []
     current = base_price
+    seed = int(base_price * 100) % 10000
+    rng = random.Random(seed)
     for i in range(days, 0, -1):
         date = datetime.now(timezone.utc) - timedelta(days=i)
-        change = random.uniform(-0.015, 0.015)
-        current = current * (1 + change)
+        drift = rng.uniform(-0.012, 0.012)
+        current = current * (1 + drift)
+        o = current * rng.uniform(0.993, 0.999)
+        h = current * rng.uniform(1.002, 1.012)
+        lo = current * rng.uniform(0.988, 0.998)
         prices.append({
             "date": date.strftime("%Y-%m-%d"),
-            "open": round(current * 0.995, 2),
-            "high": round(current * 1.01, 2),
-            "low": round(current * 0.99, 2),
+            "open": round(o, 2),
+            "high": round(h, 2),
+            "low": round(lo, 2),
             "close": round(current, 2),
-            "volume": random.randint(100000, 1000000)
+            "volume": rng.randint(100000, 2000000)
         })
     return prices
 
-def generate_forecast(base_price: float, days: int = 14) -> List[Dict]:
-    # Fallback forecast
+def generate_prophet_forecast(df: pd.DataFrame, days: int = 14) -> List[Dict]:
+    """Run Meta Prophet on historical data and return forecast."""
+    try:
+        logging.getLogger("prophet").setLevel(logging.WARNING)
+        logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+
+        pdf = df[["Date", "Close"]].rename(columns={"Date": "ds", "Close": "y"}).copy()
+        pdf["ds"] = pd.to_datetime(pdf["ds"]).dt.tz_localize(None)
+        pdf = pdf.dropna()
+
+        if len(pdf) < 20:
+            return []
+
+        model = Prophet(
+            daily_seasonality=False,
+            weekly_seasonality=True,
+            yearly_seasonality=len(pdf) > 200,
+            interval_width=0.90,
+        )
+        model.fit(pdf)
+        future = model.make_future_dataframe(periods=days)
+        fc = model.predict(future).tail(days)
+
+        return [
+            {
+                "date": str(row["ds"])[:10],
+                "predicted": round(float(row["yhat"]), 2),
+                "lower_bound": round(float(row["yhat_lower"]), 2),
+                "upper_bound": round(float(row["yhat_upper"]), 2),
+            }
+            for _, row in fc.iterrows()
+        ]
+    except Exception as e:
+        logger.error(f"Prophet error: {e}")
+        return []
+
+def generate_fallback_forecast(base_price: float, days: int = 14) -> List[Dict]:
+    """Statistical fallback forecast with smooth trend."""
     forecasts = []
     current = base_price
+    rng = random.Random(int(base_price))
+    trend = rng.uniform(-0.003, 0.005)  # slight upward drift
     for i in range(1, days + 1):
         date = datetime.now(timezone.utc) + timedelta(days=i)
-        trend = random.uniform(-0.005, 0.008)
-        current = current * (1 + trend)
-        uncertainty = 0.01 + (i * 0.002)
+        noise = rng.uniform(-0.008, 0.008)
+        current = current * (1 + trend + noise)
+        unc = 0.01 + i * 0.0015
         forecasts.append({
             "date": date.strftime("%Y-%m-%d"),
             "predicted": round(current, 2),
-            "lower_bound": round(current * (1 - uncertainty), 2),
-            "upper_bound": round(current * (1 + uncertainty), 2)
+            "lower_bound": round(current * (1 - unc), 2),
+            "upper_bound": round(current * (1 + unc), 2),
         })
     return forecasts
 
+# ─────────────────────────────────────────────────────────────────────
 # API Routes
+# ─────────────────────────────────────────────────────────────────────
 @api_router.get("/")
 async def root():
     return {"message": "Commodities Analytics Dashboard API", "status": "running"}
@@ -288,11 +352,7 @@ async def get_all_commodities():
     result = []
     for category, items in COMMODITIES.items():
         for item in items:
-            data = get_real_price(item["yahoo_symbol"])
-            if not data:
-                price, change, change_pct, high, low = generate_price_variation(item["base_price"])
-                data = {"price": price, "change": change, "change_percent": change_pct, "high": high, "low": low}
-            
+            data = await get_price(item)
             result.append({
                 "symbol": item["symbol"],
                 "name": item["name"],
@@ -302,81 +362,79 @@ async def get_all_commodities():
                 "high": round(data["high"], 2),
                 "low": round(data["low"], 2),
                 "category": category,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
     return {"commodities": result}
 
 @api_router.get("/commodities/{symbol}")
 async def get_commodity_detail(symbol: str):
     item, category = get_commodity_by_symbol(symbol)
-    if item:
-        data = get_real_price(item["yahoo_symbol"])
-        if not data:
-            price, change, change_pct, high, low = generate_price_variation(item["base_price"])
-            data = {"price": price, "change": change, "change_percent": change_pct, "high": high, "low": low}
-            
-        return {
-            "symbol": item["symbol"],
-            "name": item["name"],
-            "price": round(data["price"], 2),
-            "change": round(data["change"], 2),
-            "change_percent": round(data["change_percent"], 2),
-            "high": round(data["high"], 2),
-            "low": round(data["low"], 2),
-            "category": category,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-    raise HTTPException(status_code=404, detail="Commodity not found")
+    if not item:
+        raise HTTPException(status_code=404, detail="Commodity not found")
+    data = await get_price(item)
+    return {
+        "symbol": item["symbol"],
+        "name": item["name"],
+        "price": round(data["price"], 2),
+        "change": round(data["change"], 2),
+        "change_percent": round(data["change_percent"], 2),
+        "high": round(data["high"], 2),
+        "low": round(data["low"], 2),
+        "category": category,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 @api_router.get("/commodities/{symbol}/history")
 async def get_commodity_history(symbol: str, days: int = 30):
-    item, category = get_commodity_by_symbol(symbol)
-    if item:
-        try:
-            ticker = yf.Ticker(item["yahoo_symbol"])
-            df = ticker.history(period=f"{days}d")
-            if not df.empty:
-                history = []
-                for idx, row in df.iterrows():
-                    history.append({
-                        "date": idx.strftime("%Y-%m-%d"),
-                        "open": round(float(row['Open']), 2),
-                        "high": round(float(row['High']), 2),
-                        "low": round(float(row['Low']), 2),
-                        "close": round(float(row['Close']), 2),
-                        "volume": int(row['Volume'])
-                    })
-                return {"symbol": item["symbol"], "name": item["name"], "history": history}
-        except Exception as e:
-            logger.error(f"History fetch error: {e}")
-            
-        # Fallback
-        history = generate_historical_prices(item["base_price"], days)
+    item, _ = get_commodity_by_symbol(symbol)
+    if not item:
+        raise HTTPException(status_code=404, detail="Commodity not found")
+
+    df = await fetch_stooq_history(item["stooq"], days=max(days, 30))
+    if df is not None and not df.empty:
+        history = []
+        for _, row in df.tail(days).iterrows():
+            history.append({
+                "date": str(row["Date"])[:10],
+                "open":  round(float(row.get("Open",  row["Close"])), 2),
+                "high":  round(float(row.get("High",  row["Close"])), 2),
+                "low":   round(float(row.get("Low",   row["Close"])), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": int(float(row.get("Volume", 0) or 0)),
+            })
         return {"symbol": item["symbol"], "name": item["name"], "history": history}
-    raise HTTPException(status_code=404, detail="Commodity not found")
+
+    # Fallback
+    history = generate_historical_prices(item["base_price"], days)
+    return {"symbol": item["symbol"], "name": item["name"], "history": history}
 
 @api_router.get("/commodities/{symbol}/forecast")
 async def get_commodity_forecast(symbol: str, days: int = 14):
-    item, category = get_commodity_by_symbol(symbol)
-    if item:
-        forecast = generate_forecast_prophet(item["yahoo_symbol"], days)
-        if forecast:
+    item, _ = get_commodity_by_symbol(symbol)
+    if not item:
+        raise HTTPException(status_code=404, detail="Commodity not found")
+
+    # Try Prophet with real historical data (2 years)
+    df = await fetch_stooq_history(item["stooq"], days=730)
+    if df is not None and len(df) >= 30:
+        fc = generate_prophet_forecast(df, days)
+        if fc:
             return {
                 "symbol": item["symbol"],
                 "name": item["name"],
-                "forecast": forecast,
-                "model": "Prophet-based ML Model"
+                "forecast": fc,
+                "model": "Prophet ML Model"
             }
-        
-        # Fallback
-        forecast = generate_forecast(item["base_price"], days)
-        return {
-            "symbol": item["symbol"],
-            "name": item["name"],
-            "forecast": forecast,
-            "model": "Statistical Fallback"
-        }
-    raise HTTPException(status_code=404, detail="Commodity not found")
+
+    # Fallback: current price + statistical trend
+    data = await get_price(item)
+    fc = generate_fallback_forecast(data["price"], days)
+    return {
+        "symbol": item["symbol"],
+        "name": item["name"],
+        "forecast": fc,
+        "model": "Statistical Fallback"
+    }
 
 @api_router.get("/news")
 async def get_commodity_news(category: Optional[str] = None, limit: int = 10):
@@ -390,9 +448,9 @@ async def get_commodity_news(category: Optional[str] = None, limit: int = 10):
                 "agriculture": "wheat OR corn OR coffee OR agriculture commodities"
             }
             keywords = category_keywords.get(category, keywords)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
+
+        async with httpx.AsyncClient() as http:
+            response = await http.get(
                 "https://newsapi.org/v2/everything",
                 params={
                     "q": keywords,
@@ -404,7 +462,6 @@ async def get_commodity_news(category: Optional[str] = None, limit: int = 10):
                 timeout=10.0
             )
             data = response.json()
-            
             if data.get("status") == "ok":
                 articles = []
                 for article in data.get("articles", [])[:limit]:
@@ -432,27 +489,20 @@ async def calculate_freight_quote(
     weight_tons: float
 ):
     route_key = (origin, destination)
-    route = FREIGHT_ROUTES.get(route_key)
-    
-    if not route:
-        available_routes = list(FREIGHT_ROUTES.keys())
-        route = {
-            "distance": random.randint(5000, 15000),
-            "base_rate": random.uniform(35, 60),
-            "days": random.randint(10, 30)
-        }
-    
+    route = FREIGHT_ROUTES.get(route_key) or {
+        "distance": random.randint(5000, 15000),
+        "base_rate": random.uniform(35, 60),
+        "days": random.randint(10, 30)
+    }
     commodity_multipliers = {
         "oil": 1.2, "gas": 1.3, "gold": 1.5, "copper": 1.1,
         "wheat": 0.9, "corn": 0.9, "coffee": 1.0
     }
     multiplier = commodity_multipliers.get(commodity.lower(), 1.0)
-    
     base_cost = route["base_rate"] * weight_tons * multiplier
     fuel_surcharge = base_cost * 0.15
     insurance = base_cost * 0.05
     total_cost = base_cost + fuel_surcharge + insurance
-    
     return {
         "origin": origin,
         "destination": destination,
@@ -491,7 +541,6 @@ async def add_to_watchlist(symbol: str, name: str, category: str):
     existing = await db.watchlist.find_one({"symbol": symbol})
     if existing:
         raise HTTPException(status_code=400, detail="Already in watchlist")
-    
     item = WatchlistItem(symbol=symbol, name=name, category=category)
     doc = item.model_dump()
     doc["added_at"] = doc["added_at"].isoformat()
@@ -510,11 +559,7 @@ async def get_market_summary():
     commodities = []
     for category, items in COMMODITIES.items():
         for item in items:
-            data = get_real_price(item["yahoo_symbol"])
-            if not data:
-                price, change, change_pct, high, low = generate_price_variation(item["base_price"])
-                data = {"price": price, "change": change, "change_percent": change_pct}
-            
+            data = await get_price(item)
             commodities.append({
                 "symbol": item["symbol"],
                 "name": item["name"],
@@ -522,15 +567,13 @@ async def get_market_summary():
                 "change_percent": round(data["change_percent"], 2),
                 "category": category
             })
-    
     gainers = sorted(commodities, key=lambda x: x["change_percent"], reverse=True)[:3]
-    losers = sorted(commodities, key=lambda x: x["change_percent"])[:3]
-    
+    losers  = sorted(commodities, key=lambda x: x["change_percent"])[:3]
     return {
         "summary": {
             "total_commodities": len(commodities),
             "categories": list(COMMODITIES.keys()),
-            "market_status": "open" if datetime.now().hour >= 9 and datetime.now().hour < 17 else "closed"
+            "market_status": "open" if 9 <= datetime.now().hour < 17 else "closed"
         },
         "top_gainers": gainers,
         "top_losers": losers,
