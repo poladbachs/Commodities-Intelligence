@@ -22,8 +22,12 @@ load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]\
+# Use short server-selection timeout so bad URLs fail fast instead of hanging 30s
+client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=3000)
+db = client[os.environ['DB_NAME']]
+
+# Only use MongoDB cache when connected to a real cluster (not localhost)
+USE_DB_CACHE = "localhost" not in mongo_url and "127.0.0.1" not in mongo_url
 
 # API Keys
 NEWS_API_KEY = os.environ.get('NEWS_API_KEY', '')
@@ -91,7 +95,7 @@ class WatchlistItem(BaseModel):
 COMMODITIES = {
     "energy": [
         {"symbol": "WTI",   "name": "WTI Crude Oil",  "base_price": 78.50,   "stooq": "cl.f"},
-        {"symbol": "BRENT", "name": "Brent Crude",     "base_price": 82.30,   "stooq": "lco.f"},
+        {"symbol": "BRENT", "name": "Brent Crude",     "base_price": 82.30,   "stooq": "cb.f"},
         {"symbol": "NG",    "name": "Natural Gas",     "base_price": 2.85,    "stooq": "ng.f"},
     ],
     "precious_metals": [
@@ -101,7 +105,7 @@ COMMODITIES = {
     ],
     "industrial_metals": [
         {"symbol": "HG",    "name": "Copper",          "base_price": 3.85,    "stooq": "hg.f"},
-        {"symbol": "ALI",   "name": "Aluminum",        "base_price": 2245.00, "stooq": "ali.f"},
+        {"symbol": "ALI",   "name": "Aluminum",        "base_price": 2245.00, "stooq": "q8.f"},
     ],
     "agriculture": [
         {"symbol": "ZW",    "name": "Wheat",           "base_price": 5.82,    "stooq": "zw.f"},
@@ -127,6 +131,16 @@ STOOQ_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+def _safe_float(val, default: float = 0.0) -> float:
+    """Convert Stooq value to float, treating 'N/D' and blanks as default."""
+    try:
+        s = str(val).strip()
+        if not s or s in ("N/D", "-", "N/A", "null"):
+            return default
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
 async def fetch_stooq_quote(stooq_symbol: str) -> Optional[Dict]:
     """Fetch latest quote for a single symbol from Stooq CSV endpoint."""
     url = f"https://stooq.com/q/l/?s={stooq_symbol}&f=sd2t2ohlcv&h&e=csv"
@@ -135,17 +149,20 @@ async def fetch_stooq_quote(stooq_symbol: str) -> Optional[Dict]:
             resp = await http.get(url)
             resp.raise_for_status()
             text = resp.text.strip()
+            if not text or "\n" not in text:
+                return None
             reader = csv.DictReader(io.StringIO(text))
             rows = list(reader)
             if not rows:
                 return None
-            row = rows[-1]  # most recent row
-            close = float(row.get("Close", 0) or 0)
-            open_ = float(row.get("Open", close) or close)
-            high  = float(row.get("High", close) or close)
-            low   = float(row.get("Low",  close) or close)
-            vol   = int(float(row.get("Volume", 0) or 0))
+            row = rows[-1]
+            close = _safe_float(row.get("Close", 0))
+            open_ = _safe_float(row.get("Open", close), close)
+            high  = _safe_float(row.get("High",  close), close)
+            low   = _safe_float(row.get("Low",   close), close)
+            vol   = int(_safe_float(row.get("Volume", 0)))
             if close == 0:
+                logger.warning(f"Stooq returned zero/N/D for {stooq_symbol}")
                 return None
             change = close - open_
             change_pct = (change / open_ * 100) if open_ else 0
@@ -170,12 +187,20 @@ async def fetch_stooq_history(stooq_symbol: str, days: int = 90) -> Optional[pd.
         async with httpx.AsyncClient(timeout=15.0, headers=STOOQ_HEADERS) as http:
             resp = await http.get(url)
             resp.raise_for_status()
-            df = pd.read_csv(io.StringIO(resp.text))
-            if df.empty or "Date" not in df.columns:
+            text = resp.text.strip()
+            if not text or "Date" not in text:
+                logger.warning(f"Stooq history empty for {stooq_symbol}")
                 return None
-            df["Date"] = pd.to_datetime(df["Date"])
+            df = pd.read_csv(io.StringIO(text))
+            if df.empty or "Date" not in df.columns or "Close" not in df.columns:
+                return None
+            # Replace N/D strings with NaN, then drop those rows
+            df.replace("N/D", np.nan, inplace=True)
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df = df.dropna(subset=["Date", "Close"])
             df = df.sort_values("Date").reset_index(drop=True)
-            return df
+            return df if not df.empty else None
     except Exception as e:
         logger.error(f"Stooq history error for {stooq_symbol}: {e}")
         return None
@@ -187,40 +212,42 @@ async def get_cached_price(stooq_symbol: str) -> Optional[Dict]:
     """Return price from memory or MongoDB if not stale."""
     now = datetime.now(timezone.utc)
 
-    # 1. Memory cache
+    # 1. Memory cache (fastest)
     if stooq_symbol in price_cache:
         data, ts = price_cache[stooq_symbol]
         if now - ts < CACHE_TTL:
             return data
 
-    # 2. MongoDB cache
-    try:
-        doc = await db.price_cache.find_one({"stooq_symbol": stooq_symbol})
-        if doc:
-            ts = doc.get("updated_at")
-            if ts and isinstance(ts, datetime):
-                ts_aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-                if now - ts_aware < CACHE_TTL:
-                    data = doc["data"]
-                    price_cache[stooq_symbol] = (data, now)
-                    return data
-    except Exception as e:
-        logger.error(f"MongoDB cache read error: {e}")
+    # 2. MongoDB cache (only when connected to a real cluster)
+    if USE_DB_CACHE:
+        try:
+            doc = await db.price_cache.find_one({"stooq_symbol": stooq_symbol})
+            if doc:
+                ts = doc.get("updated_at")
+                if ts and isinstance(ts, datetime):
+                    ts_aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    if now - ts_aware < CACHE_TTL:
+                        data = doc["data"]
+                        price_cache[stooq_symbol] = (data, now)
+                        return data
+        except Exception as e:
+            logger.warning(f"MongoDB cache read skipped: {e}")
 
     return None
 
 async def set_cached_price(stooq_symbol: str, data: Dict):
-    """Store price in memory and MongoDB."""
+    """Store price in memory and (if available) MongoDB."""
     now = datetime.now(timezone.utc)
     price_cache[stooq_symbol] = (data, now)
-    try:
-        await db.price_cache.update_one(
-            {"stooq_symbol": stooq_symbol},
-            {"$set": {"data": data, "updated_at": now}},
-            upsert=True
-        )
-    except Exception as e:
-        logger.error(f"MongoDB cache write error: {e}")
+    if USE_DB_CACHE:
+        try:
+            await db.price_cache.update_one(
+                {"stooq_symbol": stooq_symbol},
+                {"$set": {"data": data, "updated_at": now}},
+                upsert=True
+            )
+        except Exception as e:
+            logger.warning(f"MongoDB cache write skipped: {e}")
 
 async def get_price(item: Dict) -> Dict:
     """
